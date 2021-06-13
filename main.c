@@ -7,6 +7,9 @@
 #include <glad/glad.h>
 #include <GLFW/glfw3.h>
 
+#define MINIAUDIO_IMPLEMENTATION
+#include "./deps/lib/miniaudio.h"
+
 #include "./deps/lib/linmath.h"
 
 /* TODO:
@@ -17,12 +20,15 @@
  * [X] render characters
  * [X] A pushes B
  * [X] A pulls B when > 2
+ * [X] level transition
+ * [ ] ingegrate audio library
  * tiles
  * [X] normal (no special properties)
  * [X] wall (cannot walk through, string must go around)
  * [X] water (A dies when walking in, B can be pushed in)
- * [ ] block (can be pushed into water to create a path)
- * [ ] ice (entity slides across)
+ * [X] block (can be pushed into water to create a path)
+ * [?] ice (entity slides across)
+ * [?] deep-snow / quick-sand (can push B through, can't pull B out)
  */
 
 #define u8 uint8_t
@@ -50,7 +56,8 @@ typedef enum entity_type {
 	ENTITY_TYPE_PLAYER_A,
 	ENTITY_TYPE_PLAYER_B,
 	ENTITY_TYPE_PLAYER_BOTH,
-	ENTITY_TYPE_COLLECTABLE
+	ENTITY_TYPE_COLLECTABLE,
+	ENTITY_TYPE_BLOCK
 } Entity_Type;
 
 typedef enum tile_type {
@@ -89,12 +96,19 @@ typedef struct state {
 	Tile tiles[64];
 	int player_a_index;
 	int player_b_index;
-	char level_name[80];
+	int level_index;
 	int chain_indices[2];
 	int chain_visible[2];
 	BFS_Result last_bfs;
 	int collected;
 	int collectable_count;
+	bool on_ice;
+	bool b_on_ice;
+	int ice_direction;
+	f32 ice_timer;
+	f32 time_now;
+	f32 time_last_frame;
+	f32 delta_time;
 } State;
 
 static GLFWwindow *window;
@@ -105,19 +119,25 @@ static u32 square_ebo;
 static u32 line_vao;
 static u32 line_vbo;
 static mat4x4 projection;
+static const char *levels[] = { "level1.dat", "level2.dat", "level3.dat", "level4.dat" };
 
-static vec4 color_white = { 1.0f, 1.0f, 1.0f, 1.0f };
-static vec4 color_black = { 0.0f, 0.0f, 0.0f, 1.0f };
-static vec4 color_bg = { 0.2f, 0.0f, 0.2f, 1.0f };
-static vec4 color_grey100 = { 0.1f, 0.1f, 0.1f, 1.0f };
-static vec4 color_grey200 = { 0.2f, 0.2f, 0.2f, 1.0f };
-static vec4 color_grey400 = { 0.4f, 0.4f, 0.4f, 1.0f };
-static vec4 color_water = {0.1f, 0.4f, 0.4f, 1.0f};
+ma_device device;
+ma_decoder decoder;
+ma_decoder decoder2;
+ma_device_config device_config;
+
+static vec4 color_white = {1.0f, 1.0f, 1.0f, 1.0f};
+static vec4 color_black = {0.0f, 0.0f, 0.0f, 1.0f};
+static vec4 color_bg = {0.2f, 0.0f, 0.2f, 1.0f};
+static vec4 color_tile_outline = {0.15f, 0.15f, 0.15f, 1.0f};
+static vec4 color_tile_fill = {0.1f, 0.1f, 0.1f, 1.0f};
+static vec4 color_block = {0.75f, 0.63f, 0.44f, 1.0f};
+static vec4 color_water = {0.1f, 0.6f, 0.8f, 1.0f};
 static vec4 color_ice = {0.1f, 0.9f, 0.9f, 1.0f};
 static vec4 color_orange = {1.0f, 0.55f, 0.1f, 1.0f};
 static vec4 color_teal = {0.0f, 0.8f, 0.9f, 1.0f};
 static vec4 color_salmon = {1.0f, 0.24f, 0.24f, 1.0f};
-static vec4 color_green  = {0.0f, 1.0f, 0.0f, 1.0f};
+static vec4 color_green = {0.0f, 1.0f, 0.0f, 1.0f};
 static vec4 color_goal = {0.9f, 0.9f, 0.0f, 1.0f};
 
 static State state = {0};
@@ -153,6 +173,16 @@ static Queue_Item *dequeue(Queue *queue) {
 	return temp;
 }
 
+void play_sound(ma_decoder *decoder) {
+	device_config.pUserData         = decoder;
+	if (ma_device_start(&device) != MA_SUCCESS) {
+		fprintf(stderr, "Failed to start playback device");
+		ma_device_uninit(&device);
+		ma_decoder_uninit(decoder);
+		return -4;
+	}
+}
+
 static char *read_file_into_buffer(const char *path) {
 	FILE *fp = fopen(path, "rb");
 	if (!fp)
@@ -165,6 +195,7 @@ static char *read_file_into_buffer(const char *path) {
 		error_and_exit(-1, "Can't allocate file buffer");
 	fread(buffer, sizeof(char), length, fp);
 	buffer[length] = 0;
+	fclose(fp);
 	return buffer;
 }
 
@@ -192,6 +223,8 @@ static BFS_Result bfs(int start, int goal) {
 			if (index == -1)
 				continue;
 			if (state.tiles[index].type == TILE_TYPE_WALL)
+				continue;
+			if (state.tiles[index].entity == ENTITY_TYPE_BLOCK)
 				continue;
 			if (result.came_from[index] == -1) {
 				Queue_Item *new_item = enqueue(&q);
@@ -221,14 +254,12 @@ static BFS_Result bfs(int start, int goal) {
 	return result;
 }
 
-static void load_level(const char *path) {
-	char *level_data = read_file_into_buffer(path);
+static void load_level(int index) {
+	char *level_data = read_file_into_buffer(levels[index]);
 
-	memset(&state, 0, sizeof(State));
-
-	int name_length = strlen(path);
-	memcpy(state.level_name, path, name_length * sizeof(char));
-	state.level_name[name_length] = 0;
+	state.level_index = index;
+	state.collectable_count = 0;
+	state.collected = 0;
 
 	for (int row = 0; row < 8; ++row) {
 		char *start = &level_data[row * 9];
@@ -255,6 +286,7 @@ static void load_level(const char *path) {
 			} break;
 			case 'X': tile->type = TILE_TYPE_GOAL; break;
 			case '+': tile->type = TILE_TYPE_ICE; break;
+			case ':': tile->entity = ENTITY_TYPE_BLOCK; break;
 			}
 		}
 	}
@@ -325,24 +357,103 @@ static int can_move(int direction, int index) {
 	return -1;
 }
 
+// a lot of compression could be don here
 static void try_move(int direction, int index) {
-	int last_a = state.player_a_index;
-	int last_b = state.player_b_index;
+	bool pulled_a = false;
 	int new_index = can_move(direction, index);
 	if (new_index >= 0) {
 		switch (state.tiles[index].entity) {
+		case ENTITY_TYPE_PLAYER_B: {
+			if (state.b_on_ice) {
+				// stop at A
+				if (state.tiles[new_index].entity == ENTITY_TYPE_PLAYER_A) {
+					state.b_on_ice = false;
+					break;
+				}
+				// slide
+				state.tiles[new_index].entity = ENTITY_TYPE_PLAYER_B;
+				state.tiles[index].entity = ENTITY_TYPE_NONE;
+				state.player_b_index = new_index;
+				// pull A
+				BFS_Result r = bfs(state.player_a_index, state.player_b_index);
+				if (r.distance > 2) {
+					pulled_a = true;
+					state.chain_indices[0] = r.path[2];
+					state.chain_indices[1] = r.path[3];
+					state.tiles[state.player_a_index].entity = ENTITY_TYPE_NONE;
+					state.tiles[r.path[3]].entity = ENTITY_TYPE_PLAYER_A;
+					state.player_a_index = r.path[3];
+					state.chain_visible[0] = 1;
+					state.chain_visible[1] = 1;
+
+					if (state.tiles[state.player_b_index].type == TILE_TYPE_ICE) {
+						state.b_on_ice = true;
+						state.ice_direction = direction;
+					}
+				}
+				// reup ice status
+				if (state.tiles[new_index].type == TILE_TYPE_ICE) {
+					state.ice_timer = 0.5f;
+					state.b_on_ice = true;
+				} else {
+					state.b_on_ice = false;
+				}
+			}
+		} break;
 		case ENTITY_TYPE_PLAYER_A: {
+			if (state.tiles[new_index].entity == ENTITY_TYPE_COLLECTABLE) {
+				++state.collected;
+			}
+			// if on ice
+			if (state.on_ice) {
+				if (state.tiles[new_index].type == TILE_TYPE_ICE) {
+					state.ice_timer = 0.5f;
+				} else {
+					// exit ice
+					state.on_ice = false;
+				}
+				state.tiles[new_index].entity = ENTITY_TYPE_PLAYER_A;
+				state.tiles[index].entity = ENTITY_TYPE_NONE;
+				state.player_a_index = new_index;
+				// pushing B on ice
+				if (state.tiles[new_index].entity == ENTITY_TYPE_PLAYER_B) {
+					int new_b_index = can_move(direction, new_index);
+					if (new_b_index >= 0) {
+						state.tiles[new_b_index].entity = ENTITY_TYPE_PLAYER_B;
+						state.player_b_index = new_b_index;
+					}
+				}
+				break;
+
+			}
+			// if entering ice
+			if (state.tiles[new_index].type == TILE_TYPE_ICE) {
+				state.on_ice = true;
+				state.ice_timer = 0.5f;
+				state.ice_direction = direction;
+				state.tiles[new_index].entity = ENTITY_TYPE_PLAYER_A;
+				state.tiles[index].entity = ENTITY_TYPE_NONE;
+				state.player_a_index = new_index;
+				break;
+			}
 			// if pushing B
 			if (state.tiles[new_index].entity == ENTITY_TYPE_PLAYER_B) {
+				// if pushing onto ice
+				if (state.tiles[new_index].type == TILE_TYPE_ICE) {
 				// if riding B
-				if (state.tiles[new_index].type == TILE_TYPE_WATER) {
+				} else if (state.tiles[new_index].type == TILE_TYPE_WATER) {
 					state.tiles[new_index].entity = ENTITY_TYPE_PLAYER_BOTH;
 					state.tiles[index].entity = ENTITY_TYPE_NONE;
 					state.player_a_index = new_index;
 					state.player_b_index = new_index;
+				} else if (state.tiles[new_index].type == TILE_TYPE_GOAL) {
+					load_level(state.level_index + 1);
 				} else {
 					int new_b_index = can_move(direction, new_index);
 					if (new_b_index >= 0) {
+						if (state.tiles[new_b_index].entity == ENTITY_TYPE_BLOCK) {
+							break;
+						}
 						state.tiles[new_b_index].entity = ENTITY_TYPE_PLAYER_B;
 						state.player_b_index = new_b_index;
 						state.tiles[new_index].entity = ENTITY_TYPE_PLAYER_A;
@@ -350,11 +461,18 @@ static void try_move(int direction, int index) {
 						state.player_a_index = new_index;
 					}
 				}
-			} else if (state.tiles[new_index].entity == ENTITY_TYPE_COLLECTABLE) {
-				state.tiles[index].entity = ENTITY_TYPE_NONE;
-				state.tiles[new_index].entity = ENTITY_TYPE_PLAYER_A;
-				state.player_a_index = new_index;
-				++state.collected;
+			// pushing a block
+			} else if (state.tiles[new_index].entity == ENTITY_TYPE_BLOCK) {
+				int new_block_index = can_move(direction, new_index);
+				if (new_block_index >= 0) {
+					if (state.tiles[new_block_index].type == TILE_TYPE_WATER)
+						state.tiles[new_block_index].type = TILE_TYPE_NORMAL;
+					else
+						state.tiles[new_block_index].entity = ENTITY_TYPE_BLOCK;
+					state.tiles[new_index].entity = ENTITY_TYPE_PLAYER_A;
+					state.tiles[index].entity = ENTITY_TYPE_NONE;
+					state.player_a_index = new_index;
+				}
 			} else {
 				state.tiles[index].entity = ENTITY_TYPE_NONE;
 				state.tiles[new_index].entity = ENTITY_TYPE_PLAYER_A;
@@ -363,6 +481,22 @@ static void try_move(int direction, int index) {
 
 		} break;
 		case ENTITY_TYPE_PLAYER_BOTH: {
+			if (state.tiles[new_index].entity == ENTITY_TYPE_COLLECTABLE) {
+				++state.collected;
+			}
+			// pushing a block
+			if (state.tiles[new_index].entity == ENTITY_TYPE_BLOCK) {
+				int new_block_index = can_move(direction, new_index);
+				if (new_block_index >= 0) {
+					if (state.tiles[new_block_index].type == TILE_TYPE_WATER)
+						state.tiles[new_block_index].type = TILE_TYPE_NORMAL;
+					else
+						state.tiles[new_block_index].entity = ENTITY_TYPE_BLOCK;
+					state.tiles[new_index].entity = ENTITY_TYPE_PLAYER_A;
+					state.tiles[index].entity = ENTITY_TYPE_NONE;
+					state.player_a_index = new_index;
+				}
+			}
 			state.player_a_index = new_index;
 			state.tiles[new_index].entity = ENTITY_TYPE_PLAYER_A;
 			state.tiles[index].entity = ENTITY_TYPE_PLAYER_B;
@@ -371,41 +505,52 @@ static void try_move(int direction, int index) {
 		}
 	}
 
-	// pull chain
-	BFS_Result r = bfs(state.player_a_index, state.player_b_index);
-	if (r.distance > 2) {
-		state.chain_indices[0] = r.path[3];
-		state.chain_indices[1] = r.path[2];
-		state.tiles[state.player_b_index].entity = ENTITY_TYPE_NONE;
-		state.tiles[r.path[1]].entity = ENTITY_TYPE_PLAYER_B;
-		state.player_b_index = r.path[1];
-		state.chain_visible[0] = 1;
-		state.chain_visible[1] = 1;
-	} else {
-		if (r.distance == 0) {
-			state.chain_visible[0] = 0;
-			state.chain_visible[1] = 0;
-		} else if (r.distance == 1) {
-			state.chain_indices[1] = r.path[1];
-			state.chain_visible[0] = 0;
-			state.chain_visible[1] = 1;
-		} else if (r.distance == 2) {
-			state.chain_indices[0] = r.path[2];
-			state.chain_indices[1] = r.path[1];
+	if (!pulled_a) {
+		// pull chain
+		BFS_Result r = bfs(state.player_a_index, state.player_b_index);
+		if (r.distance > 2) {
+			state.chain_indices[0] = r.path[3];
+			state.chain_indices[1] = r.path[2];
+			state.tiles[state.player_b_index].entity = ENTITY_TYPE_NONE;
+			state.tiles[r.path[1]].entity = ENTITY_TYPE_PLAYER_B;
+			state.player_b_index = r.path[1];
 			state.chain_visible[0] = 1;
 			state.chain_visible[1] = 1;
+
+			if (state.tiles[state.player_b_index].type == TILE_TYPE_ICE) {
+				state.b_on_ice = true;
+				state.ice_direction = direction;
+			}
+		} else {
+			if (r.distance == 0) {
+				state.chain_visible[0] = 0;
+				state.chain_visible[1] = 0;
+			} else if (r.distance == 1) {
+				state.chain_indices[1] = r.path[1];
+				state.chain_visible[0] = 0;
+				state.chain_visible[1] = 1;
+			} else if (r.distance == 2) {
+				state.chain_indices[0] = r.path[2];
+				state.chain_indices[1] = r.path[1];
+				state.chain_visible[0] = 1;
+				state.chain_visible[1] = 1;
+			}
 		}
 	}
 
 	// game over
 	if (state.tiles[state.player_a_index].type == TILE_TYPE_WATER && state.player_a_index != state.player_b_index) {
-		load_level(state.level_name);
+		load_level(state.level_index);
 	}
 }
 
 static void key_callback(GLFWwindow *window, int key, int scancode, int action, int mods) {
 	if (key == GLFW_KEY_ESCAPE && action == GLFW_PRESS)
 		glfwSetWindowShouldClose(window, GLFW_TRUE);
+
+	// can't move off ice
+	if (state.on_ice || state.b_on_ice)
+		return;
 
 	if (key == GLFW_KEY_LEFT && action == GLFW_PRESS) {
 		try_move(LEFT, state.player_a_index);
@@ -415,6 +560,10 @@ static void key_callback(GLFWwindow *window, int key, int scancode, int action, 
 		try_move(UP, state.player_a_index);
 	} else if (key == GLFW_KEY_DOWN && action == GLFW_PRESS) {
 		try_move(DOWN, state.player_a_index);
+	}
+
+	if (key == GLFW_KEY_G && action == GLFW_PRESS) {
+		play_sound(&decoder2);
 	}
 }
 
@@ -523,6 +672,45 @@ static void setup_shaders() {
 	}
 }
 
+static void data_callback(ma_device *device, void *output, const void *input, u32 frame_count) {
+	ma_decoder *decoder = (ma_decoder*)device->pUserData;
+	fprintf(stderr, "????");
+	if (decoder == NULL) {
+		return;
+	}
+
+	ma_data_source_read_pcm_frames(decoder, output, frame_count, NULL, MA_FALSE);
+	(void)input;
+} 
+
+static void setup_audio() {
+	ma_result result;
+
+	result = ma_decoder_init_file("test.wav", NULL, &decoder);
+	if (result != MA_SUCCESS) {
+		return -2;
+	}
+
+	result = ma_decoder_init_file("test2.wav", NULL, &decoder2);
+	if (result != MA_SUCCESS) {
+		return -2;
+	}
+
+	device_config = ma_device_config_init(ma_device_type_playback);
+	device_config.playback.format   = decoder.outputFormat;
+	device_config.playback.channels = decoder.outputChannels;
+	device_config.sampleRate        = decoder.outputSampleRate;
+	device_config.dataCallback      = data_callback;
+	device_config.pUserData         = &decoder;
+
+	if (ma_device_init(NULL, &device_config, &device) != MA_SUCCESS) {
+		fprintf(stderr, "Failed to open playback device\n");
+		ma_decoder_uninit(&decoder);
+		return -3;
+	}
+
+}
+
 static void render_square(f32 x, f32 y, f32 width, f32 height, vec4 color) {
 	mat4x4 model;
 	mat4x4_identity(model);
@@ -563,6 +751,9 @@ static void render_entity(f32 x, f32 y, Entity_Type type) {
 	} break;
 	case ENTITY_TYPE_COLLECTABLE: {
 		render_square(x + 6, y + 6, BOARD_TILE_SIZE / 4, BOARD_TILE_SIZE / 4, color_green);
+	} break;
+	case ENTITY_TYPE_BLOCK: {
+		render_square(x + 2, y + 2, BOARD_TILE_SIZE - 4, BOARD_TILE_SIZE - 4, color_block);
 	} break;
 	}
 }
@@ -639,8 +830,16 @@ static void render_board() {
 				BOARD_OFFSET_Y + y * BOARD_TILE_SIZE,
 				BOARD_TILE_SIZE,
 				BOARD_TILE_SIZE,
-				(y + x) % 2 == 0 ? color_grey100 : color_grey200
+				color_tile_outline
 			);
+			render_square(
+				BOARD_OFFSET_X + x * BOARD_TILE_SIZE + 1,
+				BOARD_OFFSET_Y + y * BOARD_TILE_SIZE + 1,
+				BOARD_TILE_SIZE - 2,
+				BOARD_TILE_SIZE - 2,
+				color_tile_fill
+			);
+				// (y + x) % 2 == 0 ? color_tile_a : color_tile_b
 			render_tile(x, y, state.tiles[y * 8 + x]);
 		}
 	}
@@ -675,14 +874,36 @@ static void render() {
 	glfwSwapBuffers(window);
 }
 
+static void ice_check() {
+	if (state.on_ice || state.b_on_ice) {
+		if (state.ice_timer <= 0) {
+			if (state.b_on_ice) {
+				try_move(state.ice_direction, state.player_b_index);
+			}
+			if (state.on_ice) {
+				try_move(state.ice_direction, state.player_a_index);
+			}
+		}
+		state.ice_timer -= state.delta_time;
+		printf("%f\n", state.ice_timer);
+	}
+}
+
 int main(void) {
 	setup_window();
 	setup_rendering();
 	setup_shaders();
+	setup_audio();
 
-	load_level("level1.dat");
+	load_level(0);
 
-	while (!glfwWindowShouldClose(window))
+	while (!glfwWindowShouldClose(window)) {
+		state.time_last_frame = state.time_now;
+		state.time_now = (f32)glfwGetTime();
+		state.delta_time = state.time_now - state.time_last_frame;
+
+		ice_check();
 		render();
+	}
 	return 0;
 }

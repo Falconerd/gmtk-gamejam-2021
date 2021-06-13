@@ -1,5 +1,5 @@
 flags = -Wall -pedantic -std=c99
-libs = -lX11 -lglfw -lm -ldl -lfreetype
+libs = -lX11 -lglfw-ldl
 inc = -I./deps/include
 
 build: main.c glad.o
@@ -14,3 +14,4 @@ run:
 clean:
 	@rm -f ./a.out
 	@rm -f ./*.o
+	@rm -f ./*.obj
