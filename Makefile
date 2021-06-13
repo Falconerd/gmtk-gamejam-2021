@@ -1,5 +1,5 @@
 flags = -Wall -pedantic -std=c99
-libs = -lX11 -lglfw-ldl
+libs = -lX11 -lglfw -ldl
 inc = -I./deps/include
 
 build: main.c glad.o
