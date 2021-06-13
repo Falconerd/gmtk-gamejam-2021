@@ -93,6 +93,8 @@ typedef struct state {
 	int chain_indices[2];
 	int chain_visible[2];
 	BFS_Result last_bfs;
+	int collected;
+	int collectable_count;
 } State;
 
 static GLFWwindow *window;
@@ -106,6 +108,7 @@ static mat4x4 projection;
 
 static vec4 color_white = { 1.0f, 1.0f, 1.0f, 1.0f };
 static vec4 color_black = { 0.0f, 0.0f, 0.0f, 1.0f };
+static vec4 color_bg = { 0.2f, 0.0f, 0.2f, 1.0f };
 static vec4 color_grey100 = { 0.1f, 0.1f, 0.1f, 1.0f };
 static vec4 color_grey200 = { 0.2f, 0.2f, 0.2f, 1.0f };
 static vec4 color_grey400 = { 0.4f, 0.4f, 0.4f, 1.0f };
@@ -221,6 +224,8 @@ static BFS_Result bfs(int start, int goal) {
 static void load_level(const char *path) {
 	char *level_data = read_file_into_buffer(path);
 
+	memset(&state, 0, sizeof(State));
+
 	int name_length = strlen(path);
 	memcpy(state.level_name, path, name_length * sizeof(char));
 	state.level_name[name_length] = 0;
@@ -246,6 +251,7 @@ static void load_level(const char *path) {
 			} break;
 			case 'c': {
 				tile->entity = ENTITY_TYPE_COLLECTABLE;
+				++state.collectable_count;
 			} break;
 			case 'X': tile->type = TILE_TYPE_GOAL; break;
 			case '+': tile->type = TILE_TYPE_ICE; break;
@@ -344,6 +350,11 @@ static void try_move(int direction, int index) {
 						state.player_a_index = new_index;
 					}
 				}
+			} else if (state.tiles[new_index].entity == ENTITY_TYPE_COLLECTABLE) {
+				state.tiles[index].entity = ENTITY_TYPE_NONE;
+				state.tiles[new_index].entity = ENTITY_TYPE_PLAYER_A;
+				state.player_a_index = new_index;
+				++state.collected;
 			} else {
 				state.tiles[index].entity = ENTITY_TYPE_NONE;
 				state.tiles[new_index].entity = ENTITY_TYPE_PLAYER_A;
@@ -635,9 +646,23 @@ static void render_board() {
 	}
 }
 
+static void render_score() {
+	int x = BOARD_TILE_SIZE;
+	int y = HEIGHT - BOARD_TILE_SIZE * 2;
+	for (int i = 0; i < state.collectable_count; ++i) {
+    		if (state.collected > i) {
+        		render_square(x + 6, y + 6, BOARD_TILE_SIZE / 4, BOARD_TILE_SIZE / 4, color_green);
+    		} else {
+        		render_square(x + 6, y + 6, BOARD_TILE_SIZE / 4, BOARD_TILE_SIZE / 4, color_green);
+        		render_square(x + 7, y + 7, BOARD_TILE_SIZE / 4 - 2, BOARD_TILE_SIZE / 4 - 2, color_bg);
+    		}
+    		x += BOARD_TILE_SIZE;
+	}
+}
+
 static void render() {
 	glfwPollEvents();
-	glClearColor(0.2f, 0.0f, 0.2f, 1.0f);
+	glClearColor(color_bg[0], color_bg[1], color_bg[2], color_bg[3]);
 	glClear(GL_COLOR_BUFFER_BIT);
 
 	glUseProgram(shader);
