@@ -235,6 +235,10 @@ static BFS_Result bfs(int start, int goal, int direction) {
 }
 
 static void load_level(int index) {
+	if (index == 6) {
+		printf("Thanks for playing!\n");
+		glfwSetWindowShouldClose(window, GLFW_TRUE);
+	}
 	char *level_data = read_file_into_buffer(levels[index]);
 
 	state.level_index = index;
@@ -475,7 +479,7 @@ static void setup_window() {
 	glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
 	glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
 
-	window = glfwCreateWindow(WIDTH * SCALE, HEIGHT * SCALE, "Puzzle game", NULL, NULL);
+	window = glfwCreateWindow(WIDTH * SCALE, HEIGHT * SCALE, "Puzzle game", glfwGetPrimaryMonitor(), NULL);
 	if (!window) {
 		error_and_exit(-1, "Failed to create window");
 	}
@@ -708,5 +712,8 @@ int main(void) {
 	while (!glfwWindowShouldClose(window)) {
 		render();
 	}
+
+	glfwTerminate();
+
 	return 0;
 }
